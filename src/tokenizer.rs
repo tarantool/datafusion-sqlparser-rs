@@ -9,6 +9,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Changes made by [molyee], [2025-07-30]:
+// - allow iterating over tokens from tokenizer
 
 //! SQL Tokenizer
 //!
@@ -554,6 +557,55 @@ struct TokenizeQuotedStringSettings {
     backslash_escape: bool,
 }
 
+/// Token iterator generated from [Tokenizer]
+///
+/// Use [Tokenizer::into_tokens] or [Tokenizer]'s [IntoIterator]
+/// implementation to instantiate the iterator
+pub struct TokenIter<'a> {
+    tokenizer: Tokenizer<'a>,
+    state: State<'a>,
+}
+
+impl<'a> TokenIter<'a> {
+    /// Add location information to tokens
+    pub fn with_locations(self) -> TokenWithLocationIter<'a> {
+        TokenWithLocationIter {
+            tokenizer: self.tokenizer,
+            state: self.state,
+        }
+    }
+}
+
+impl<'a> Iterator for TokenIter<'a> {
+    type Item = Result<Token, TokenizerError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.tokenizer.next_token(&mut self.state).transpose()
+    }
+}
+
+/// TokenWithLocation iterator generated from [Tokenizer]
+///
+/// Use [TokenIter::with_locations] to instantiate the iterator
+pub struct TokenWithLocationIter<'a> {
+    tokenizer: Tokenizer<'a>,
+    state: State<'a>,
+}
+
+impl<'a> Iterator for TokenWithLocationIter<'a> {
+    type Item = Result<TokenWithLocation, TokenizerError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let location = self.state.location();
+        let item = self
+            .tokenizer
+            .next_token(&mut self.state)
+            .transpose()?
+            .map(|token| TokenWithLocation { token, location });
+        Some(item)
+    }
+}
+
 /// SQL Tokenizer
 pub struct Tokenizer<'a> {
     dialect: &'a dyn Dialect,
@@ -561,6 +613,20 @@ pub struct Tokenizer<'a> {
     /// If true (the default), the tokenizer will un-escape literal
     /// SQL strings See [`Tokenizer::with_unescape`] for more details.
     unescape: bool,
+}
+
+impl<'a> AsRef<dyn Dialect> for Tokenizer<'a> {
+    fn as_ref(&self) -> &'a dyn Dialect {
+        self.dialect
+    }
+}
+
+impl<'a> IntoIterator for Tokenizer<'a> {
+    type IntoIter = TokenIter<'a>;
+    type Item = Result<Token, TokenizerError>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_tokens()
+    }
 }
 
 impl<'a> Tokenizer<'a> {
@@ -623,14 +689,25 @@ impl<'a> Tokenizer<'a> {
         self
     }
 
+    /// Transform [Tokenizer] into [Token] result iterator
+    pub fn into_tokens(self) -> TokenIter<'a> {
+        let state = State {
+            peekable: self.query.chars().peekable(),
+            line: 1,
+            col: 1,
+        };
+        let tokenizer = self;
+        TokenIter { tokenizer, state }
+    }
+
     /// Tokenize the statement and produce a vector of tokens
-    pub fn tokenize(&mut self) -> Result<Vec<Token>, TokenizerError> {
+    pub fn tokenize(&self) -> Result<Vec<Token>, TokenizerError> {
         let twl = self.tokenize_with_location()?;
         Ok(twl.into_iter().map(|t| t.token).collect())
     }
 
     /// Tokenize the statement and produce a vector of tokens with location information
-    pub fn tokenize_with_location(&mut self) -> Result<Vec<TokenWithLocation>, TokenizerError> {
+    pub fn tokenize_with_location(&self) -> Result<Vec<TokenWithLocation>, TokenizerError> {
         let mut tokens: Vec<TokenWithLocation> = vec![];
         self.tokenize_with_location_into_buf(&mut tokens)
             .map(|_| tokens)
@@ -639,7 +716,7 @@ impl<'a> Tokenizer<'a> {
     /// Tokenize the statement and append tokens with location information into the provided buffer.
     /// If an error is thrown, the buffer will contain all tokens that were successfully parsed before the error.
     pub fn tokenize_with_location_into_buf(
-        &mut self,
+        &self,
         buf: &mut Vec<TokenWithLocation>,
     ) -> Result<(), TokenizerError> {
         let mut state = State {
@@ -1898,6 +1975,65 @@ mod tests {
     }
 
     #[test]
+    fn token_iterator() {
+        let sql = String::from("SELECT * FROM t WHERE 'a' = ?");
+        let dialect = GenericDialect {};
+
+        let tokens = Tokenizer::new(&dialect, &sql)
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        let expected = vec![
+            Token::make_keyword("SELECT"),
+            Token::Whitespace(Whitespace::Space),
+            Token::Mul,
+            Token::Whitespace(Whitespace::Space),
+            Token::make_keyword("FROM"),
+            Token::Whitespace(Whitespace::Space),
+            Token::make_word("t", None),
+            Token::Whitespace(Whitespace::Space),
+            Token::make_keyword("WHERE"),
+            Token::Whitespace(Whitespace::Space),
+            Token::SingleQuotedString("a".into()),
+            Token::Whitespace(Whitespace::Space),
+            Token::Eq,
+            Token::Whitespace(Whitespace::Space),
+            Token::Placeholder("?".into()),
+        ];
+
+        compare(expected, tokens);
+    }
+
+    #[test]
+    fn token_iterator_finish_iteration() {
+        let sql = String::from(r#"SELECT 'a' + 'b + "c""#);
+        let dialect = GenericDialect {};
+
+        let items = Tokenizer::new(&dialect, &sql)
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        let expected = vec![
+            Ok(Token::make_keyword("SELECT")),
+            Ok(Token::Whitespace(Whitespace::Space)),
+            Ok(Token::SingleQuotedString("a".into())),
+            Ok(Token::Whitespace(Whitespace::Space)),
+            Ok(Token::Plus),
+            Ok(Token::Whitespace(Whitespace::Space)),
+            Err(TokenizerError {
+                message: "Unterminated string literal".into(),
+                location: Location {
+                    line: 1,
+                    column: 14,
+                },
+            }),
+        ];
+
+        compare(expected, items);
+    }
+
+    #[test]
     fn tokenize_select_1() {
         let sql = String::from("SELECT 1");
         let dialect = GenericDialect {};
@@ -1931,7 +2067,7 @@ mod tests {
     fn tokenize_clickhouse_double_equal() {
         let sql = String::from("SELECT foo=='1'");
         let dialect = ClickHouseDialect {};
-        let mut tokenizer = Tokenizer::new(&dialect, &sql);
+        let tokenizer = Tokenizer::new(&dialect, &sql);
         let tokens = tokenizer.tokenize().unwrap();
 
         let expected = vec![
@@ -2229,7 +2365,7 @@ mod tests {
         let sql = String::from("select 'foo");
 
         let dialect = GenericDialect {};
-        let mut tokenizer = Tokenizer::new(&dialect, &sql);
+        let tokenizer = Tokenizer::new(&dialect, &sql);
         assert_eq!(
             tokenizer.tokenize(),
             Err(TokenizerError {
@@ -2244,7 +2380,7 @@ mod tests {
         let sql = String::from("SELECT \"なにか\" FROM Y WHERE \"なにか\" = 'test;");
 
         let dialect = GenericDialect {};
-        let mut tokenizer = Tokenizer::new(&dialect, &sql);
+        let tokenizer = Tokenizer::new(&dialect, &sql);
         assert_eq!(
             tokenizer.tokenize(),
             Err(TokenizerError {
@@ -2478,7 +2614,7 @@ mod tests {
         let sql = String::from("\"foo");
 
         let dialect = GenericDialect {};
-        let mut tokenizer = Tokenizer::new(&dialect, &sql);
+        let tokenizer = Tokenizer::new(&dialect, &sql);
         assert_eq!(
             tokenizer.tokenize(),
             Err(TokenizerError {
@@ -2832,7 +2968,7 @@ mod tests {
         }
 
         for sql in [r#"'\'"#, r#"'ab\'"#] {
-            let mut tokenizer = Tokenizer::new(&dialect, sql);
+            let tokenizer = Tokenizer::new(&dialect, sql);
             assert_eq!(
                 "Unterminated string literal",
                 tokenizer.tokenize().unwrap_err().message.as_str(),
@@ -2926,7 +3062,7 @@ mod tests {
                 format!(r#"{q}{q}{q}abc"#),
             ] {
                 let dialect = BigQueryDialect {};
-                let mut tokenizer = Tokenizer::new(&dialect, sql.as_str());
+                let tokenizer = Tokenizer::new(&dialect, sql.as_str());
                 assert_eq!(
                     "Unterminated string literal",
                     tokenizer.tokenize().unwrap_err().message.as_str(),
